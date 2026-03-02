@@ -1,9 +1,7 @@
 import chalk from 'chalk';
 import path from 'path';
 import process from 'process';
-import { Builder, By } from 'selenium-webdriver';
-import * as chrome from 'selenium-webdriver/chrome.js';
-import * as until from 'selenium-webdriver/lib/until.js';
+import { chromium } from 'playwright';
 import * as translatorServer from './translator-server.mjs';
 
 const chromeExtensionDir = path.join(import.meta.dirname, 'connectors', 'build', 'manifestv3');
@@ -71,7 +69,12 @@ You may want to consider adding '[ci skip]' in the commit message.`
 	return Array.from(toTestTranslatorIDs);
 }
 
-function report(results) {
+function report(results, translatorsToTest) {
+	if (Object.keys(results).length < translatorsToTest.length) {
+		console.log(chalk.yellow("Tests for some translators did not run"));
+		return false;
+	}
+
 	var allPassed = true;
 	for (let translatorID in results) {
 		let translatorResults = results[translatorID];
@@ -107,48 +110,54 @@ function report(results) {
 
 var allPassed = false;
 
-let driver;
+let context;
 try {
 	await translatorServer.serve();
 
-	let options = new chrome.Options();
-	options.addArguments('--disable-features=DisableLoadExtensionCommandLineSwitch');
-	options.addArguments(`load-extension=${chromeExtensionDir}`);
-	if (CI) {
-		options.addArguments('headless=new');
-	}
-	if ('BROWSER_EXECUTABLE' in process.env) {
-		console.log(`Using BROWSER_EXECUTABLE=${process.env['BROWSER_EXECUTABLE']}`);
-		options.setChromeBinaryPath(process.env['BROWSER_EXECUTABLE']);
-	}
-
-	driver = await new Builder()
-		.forBrowser('chrome')
-		.setChromeOptions(options)
-		.build();
+	context = await chromium.launchPersistentContext('', {
+		channel: 'chromium',
+		headless: CI,
+		args: [
+			`--disable-extensions-except=${chromeExtensionDir}`,
+			`--load-extension=${chromeExtensionDir}`
+		]
+	});
+	console.log(`Browser version: ${context.browser().version()}`);
 
 	const translatorsToTest = await getTranslatorsToTest();
 	await new Promise(resolve => setTimeout(resolve, 500));
 
 	let testUrl = `chrome-extension://${ZOTERO_CONNECTOR_EXTENSION_ID}/tools/testTranslators/testTranslators.html#translators=${translatorsToTest.join(',')}`;
-	await driver.get(testUrl);
+	let page = await context.newPage();
+	await page.goto(testUrl);
 
-	if ((await driver.getTitle()).trim() !== 'Zotero Translator Tester') {
-		console.error('Failed to load Translator Tester extension page');
-		process.exit(2);
+	for (let i = 0; i <= 3; i++) {
+		let title = (await page.title()).trim();
+		if (title === 'Zotero Translator Tester') {
+			break;
+		}
+		if (i === 3) {
+			console.error('Failed to load Translator Tester extension page');
+			process.exit(2);
+		}
+		await new Promise(resolve => setTimeout(resolve, 100));
 	}
 
-	await driver.wait(until.elementLocated(By.id('translator-tests-complete')), 5 * 60 * 1000);
+	await page.locator('#translator-tests-complete')
+		.waitFor({
+			state: 'attached',
+			timeout: 5 * 60 * 1000,
+		});
 
-	let testResults = await driver.executeScript('return window.seleniumOutput');
-	allPassed = report(testResults);
+	let testResults = await page.evaluate(() => window.seleniumOutput);
+	allPassed = report(testResults, translatorsToTest);
 }
 catch (e) {
 	console.error(e);
 }
 finally {
 	if (!KEEP_BROWSER_OPEN) {
-		await driver.quit();
+		await context.close();
 	}
 	translatorServer.stopServing();
 	if (allPassed) {
